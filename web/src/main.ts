@@ -477,6 +477,8 @@ function authenticate(username: string, password: string): void {
                 ? OptionMessage_BoolOption.No
                 : OptionMessage_BoolOption.Yes,
             show_remote_cursor: OptionMessage_BoolOption.No,
+            image_quality: ImageQuality.Balanced,
+            custom_fps: 60,
             supported_decoding: {
               ability_vp9: selectedCodec.protocol === "vp9" ? 1 : 0,
               ability_h264: selectedCodec.protocol === "h264" ? 1 : 0,

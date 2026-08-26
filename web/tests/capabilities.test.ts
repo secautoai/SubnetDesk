@@ -20,6 +20,15 @@ describe("browser capability negotiation", () => {
     const probe: CodecSupportProbe = async () => false;
     expect(await chooseVideoCodec(probe)).toBeUndefined();
   });
+
+  test("prefers AV1 over VP9 for low-latency desktop video", async () => {
+    const supported = new Set(["av01.0.04M.08", "vp09.00.10.08"]);
+    const probe: CodecSupportProbe = async (codec) => supported.has(codec);
+    expect(await chooseVideoCodec(probe)).toEqual({
+      codec: "av01.0.04M.08",
+      protocol: "av1",
+    });
+  });
 });
 
 describe("pointer input coalescing", () => {
