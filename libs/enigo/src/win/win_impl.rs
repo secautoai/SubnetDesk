@@ -314,10 +314,14 @@ impl KeyboardControllable for Enigo {
 
     fn get_key_state(&mut self, key: Key) -> bool {
         let keycode = self.key_to_keycode(key);
-        let x = unsafe { GetKeyState(keycode as _) };
         if key == Key::CapsLock || key == Key::NumLock || key == Key::Scroll {
+            let x = unsafe { GetKeyState(keycode as _) };
             return (x & 0x1) == 0x1;
         }
+        // Input injection runs outside a window message loop. GetKeyState's
+        // queue snapshot can retain a released modifier and skip its next
+        // press; query the current down state instead.
+        let x = unsafe { GetAsyncKeyState(keycode as _) };
         return (x as u16 & 0x8000) == 0x8000;
     }
 }

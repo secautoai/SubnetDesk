@@ -28,7 +28,7 @@ interface ResetMessage {
 type WorkerInput = InitializeMessage | FrameMessage | ResetMessage;
 
 interface WorkerOutput {
-  type: "ack" | "stats" | "error";
+  type: "ack" | "stats" | "error" | "refresh";
   fps?: number;
   droppedFrames?: number;
   message?: string;
@@ -42,6 +42,7 @@ const workerScope = self as unknown as {
 let canvas: OffscreenCanvas | undefined;
 let context: OffscreenCanvasRenderingContext2D | null = null;
 let decoder: VideoDecoder | undefined;
+let decoderConfiguration: VideoDecoderConfig | undefined;
 let decodeState: VideoDecodeState = initialVideoDecodeState();
 let pendingAcks = 0;
 let renderedFrames = 0;
@@ -92,13 +93,14 @@ function initialize(message: InitializeMessage): void {
     },
     error: (error) => post({ type: "error", message: error.message }),
   });
-  decoder.configure({
+  decoderConfiguration = {
     codec: message.codec,
     codedWidth: message.width,
     codedHeight: message.height,
     optimizeForLatency: true,
     hardwareAcceleration: "prefer-hardware",
-  });
+  };
+  decoder.configure(decoderConfiguration);
 }
 
 function decode(frame: ProtocolVideoFrame): void {
@@ -107,7 +109,17 @@ function decode(frame: ProtocolVideoFrame): void {
     return;
   }
   const previousDropped = decodeState.droppedFrames;
-  decodeState = decodeVideoBatch(decoder, frame, decodeState);
+  const wasAwaitingKeyFrame = decodeState.awaitingKeyFrame;
+  decodeState = decodeVideoBatch(decoder, frame, decodeState, undefined, () => {
+    if (!decoder || !decoderConfiguration) return;
+    decoder.reset();
+    decoder.configure(decoderConfiguration);
+    while (pendingAcks > 0) {
+      pendingAcks -= 1;
+      post({ type: "ack" });
+    }
+  });
+  if (decodeState.awaitingKeyFrame && !wasAwaitingKeyFrame) post({ type: "refresh" });
   if (decodeState.awaitingKeyFrame || decodeState.droppedFrames > previousDropped) {
     post({ type: "ack" });
   } else {

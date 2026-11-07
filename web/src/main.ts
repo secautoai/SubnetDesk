@@ -1,5 +1,4 @@
 import {
-  ControlKey,
   ClipboardFormat,
   ImageQuality,
   KeyboardMode,
@@ -7,14 +6,15 @@ import {
   OptionMessage_BoolOption,
   SupportedDecoding_PreferCodec,
   type DisplayInfo,
-  type KeyEvent,
   type PeerInfo,
 } from "./generated/message";
+import { currentModifiers, modifierKeys, remoteKeyEvent } from "./keyboard";
+import { remoteCopyMessage, remotePasteMessages } from "./clipboard";
+import { applyDisplaySwitch } from "./display";
+import { PointerInput } from "./pointer";
 import { LanCryptoSession } from "./crypto";
 import {
   chooseVideoCodec,
-  coalescePointerSample,
-  initialPointerSample,
   type PointerSample,
   type SelectedVideoCodec,
 } from "./capabilities";
@@ -89,13 +89,14 @@ let authenticated = false;
 let remoteDisplay: DisplayInfo | undefined;
 let peerInfo: PeerInfo | undefined;
 let decoder: VideoDecoder | undefined;
+let decoderConfiguration: VideoDecoderConfig | undefined;
 let videoWorker: Worker | undefined;
 let canvasTransferred = false;
 let selectedCodec: SelectedVideoCodec | undefined;
 let videoDecodeState: VideoDecodeState = initialVideoDecodeState();
-let pendingPointerSample = initialPointerSample();
-let pointerAnimationFrame: number | undefined;
+const pointerInput = new PointerInput(sendMouse);
 let activePointerButton = 0;
+const heldModifiers = new Set<import("./generated/message").ControlKey>();
 let lastFrameRenderedAt = 0;
 let renderedFrames = 0;
 let displayedFps = 0;
@@ -122,10 +123,9 @@ function resetConnection(message = t("disconnected")): void {
   peerInfo = undefined;
   selectedCodec = undefined;
   videoDecodeState = initialVideoDecodeState();
-  pendingPointerSample = undefined;
+  pointerInput.reset();
+  heldModifiers.clear();
   activePointerButton = 0;
-  if (pointerAnimationFrame !== undefined) cancelAnimationFrame(pointerAnimationFrame);
-  pointerAnimationFrame = undefined;
   renderedFrames = 0;
   displayedFps = 0;
   lastFrameRenderedAt = 0;
@@ -156,62 +156,26 @@ function send(message: Message): void {
   sendRaw(cryptoSession.encrypt(message));
 }
 
-function currentModifiers(
-  event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "shiftKey" | "metaKey">,
-): ControlKey[] {
-  const modifiers: ControlKey[] = [];
-  if (event.altKey) modifiers.push(ControlKey.Alt);
-  if (event.ctrlKey) modifiers.push(ControlKey.Control);
-  if (event.shiftKey) modifiers.push(ControlKey.Shift);
-  if (event.metaKey) modifiers.push(ControlKey.Meta);
-  return modifiers;
-}
-
-const controlKeys: Record<string, ControlKey> = {
-  Alt: ControlKey.Alt,
-  Backspace: ControlKey.Backspace,
-  CapsLock: ControlKey.CapsLock,
-  Control: ControlKey.Control,
-  Delete: ControlKey.Delete,
-  ArrowDown: ControlKey.DownArrow,
-  End: ControlKey.End,
-  Escape: ControlKey.Escape,
-  Home: ControlKey.Home,
-  ArrowLeft: ControlKey.LeftArrow,
-  Meta: ControlKey.Meta,
-  PageDown: ControlKey.PageDown,
-  PageUp: ControlKey.PageUp,
-  Enter: ControlKey.Return,
-  ArrowRight: ControlKey.RightArrow,
-  Shift: ControlKey.Shift,
-  " ": ControlKey.Space,
-  Tab: ControlKey.Tab,
-  ArrowUp: ControlKey.UpArrow,
-  Insert: ControlKey.Insert,
-};
-for (let index = 1; index <= 12; index += 1) {
-  controlKeys[`F${index}`] = ControlKey[`F${index}` as keyof typeof ControlKey] as ControlKey;
-}
-
 function sendKey(event: KeyboardEvent, release = false): void {
   if (!authenticated || serverInfo.permission_profile === "view-only") return;
-  const controlKey = controlKeys[event.key];
-  if (release && controlKey === undefined) return;
-  const keyEvent: Partial<KeyEvent> = {
-    down: !release,
-    press: !release,
-    modifiers: currentModifiers(event),
-    mode: KeyboardMode.Legacy,
-  };
-  if (controlKey !== undefined) {
-    keyEvent.control_key = controlKey;
-  } else {
-    const codePoint = Array.from(event.key)[0]?.codePointAt(0);
-    if (codePoint === undefined || event.key.length > 2) return;
-    keyEvent.unicode = codePoint;
-  }
+  const keyEvent = remoteKeyEvent(event, release);
+  if (!keyEvent) return;
   event.preventDefault();
+  if (keyEvent.control_key !== undefined && modifierKeys.has(keyEvent.control_key)) {
+    if (release) heldModifiers.delete(keyEvent.control_key);
+    else heldModifiers.add(keyEvent.control_key);
+  }
   send(Message.create({ key_event: keyEvent }));
+}
+
+function releaseModifiers(): void {
+  if (authenticated && serverInfo.permission_profile !== "view-only") {
+    for (const control_key of heldModifiers) {
+      send(Message.create({ key_event: { control_key, down: false, press: false,
+        modifiers: [], mode: KeyboardMode.Legacy } }));
+    }
+  }
+  heldModifiers.clear();
 }
 
 function sendText(value: string): void {
@@ -277,14 +241,7 @@ function pointerSample(event: PointerEvent): PointerSample {
 }
 
 function queuePointerMove(event: PointerEvent): void {
-  pendingPointerSample = coalescePointerSample(pendingPointerSample, pointerSample(event));
-  if (pointerAnimationFrame !== undefined) return;
-  pointerAnimationFrame = requestAnimationFrame(() => {
-    pointerAnimationFrame = undefined;
-    const sample = pendingPointerSample;
-    pendingPointerSample = undefined;
-    if (sample) sendMouse(sample, 0);
-  });
+  pointerInput.move(pointerSample(event));
 }
 
 function sendVideoAck(): void {
@@ -337,7 +294,7 @@ function configureVideoWorker(codec: SelectedVideoCodec, display: DisplayInfo): 
     canvasTransferred = true;
     videoWorker = new Worker(serverInfo.video_worker_url, { type: "module" });
     videoWorker.addEventListener("message", (event: MessageEvent<{
-      type: "ack" | "stats" | "error";
+      type: "ack" | "stats" | "error" | "refresh";
       fps?: number;
       droppedFrames?: number;
       message?: string;
@@ -347,6 +304,8 @@ function configureVideoWorker(codec: SelectedVideoCodec, display: DisplayInfo): 
       } else if (event.data.type === "stats") {
         connectionStats.textContent =
           `${event.data.fps ?? 0} FPS · ${event.data.droppedFrames ?? 0} dropped · ${selectedCodec?.protocol.toUpperCase() ?? ""}`;
+      } else if (event.data.type === "refresh") {
+        if (authenticated) send(Message.create({ misc: { refresh_video: true } }));
       } else {
         recoverDecoder(event.data.message ?? t("unknownError"), "worker");
       }
@@ -423,13 +382,14 @@ function configureDecoder(peer: PeerInfo, recovering = false): void {
     },
     error: (error) => recoverDecoder(error.message, "main"),
   });
-  decoder.configure({
+  decoderConfiguration = {
     codec: codec.codec,
     codedWidth: display.width,
     codedHeight: display.height,
     optimizeForLatency: true,
     hardwareAcceleration: "prefer-hardware",
-  });
+  };
+  decoder.configure(decoderConfiguration);
   }
   displaySelect.replaceChildren(
     ...peer.displays.map((item, index) => {
@@ -524,6 +484,10 @@ async function handleMessage(payload: Uint8Array, credentials: Credentials): Pro
     setStatus(t("connected"));
   }
   if (message.peer_info) configureDecoder(message.peer_info);
+  if (message.misc?.switch_display && peerInfo) {
+    const updated = applyDisplaySwitch(peerInfo, message.misc.switch_display);
+    if (updated) configureDecoder(updated);
+  }
   if (message.video_frame) {
     if (videoWorker) {
       videoWorker.postMessage(
@@ -532,7 +496,17 @@ async function handleMessage(payload: Uint8Array, credentials: Credentials): Pro
       );
     } else if (decoder) {
       const previousDropped = videoDecodeState.droppedFrames;
-      videoDecodeState = decodeVideoBatch(decoder, message.video_frame, videoDecodeState);
+      const wasAwaitingKeyFrame = videoDecodeState.awaitingKeyFrame;
+      videoDecodeState = decodeVideoBatch(decoder, message.video_frame, videoDecodeState, undefined, () => {
+        if (!decoder || !decoderConfiguration) return;
+        decoder.reset();
+        decoder.configure(decoderConfiguration);
+        if (videoAckPending) sendVideoAck();
+        videoAckPending = false;
+      });
+      if (videoDecodeState.awaitingKeyFrame && !wasAwaitingKeyFrame) {
+        send(Message.create({ misc: { refresh_video: true } }));
+      }
       if (
         videoDecodeState.awaitingKeyFrame ||
         videoDecodeState.droppedFrames > previousDropped
@@ -648,15 +622,15 @@ canvas.addEventListener("pointerdown", (event) => {
   canvas.focus();
   canvas.setPointerCapture(event.pointerId);
   activePointerButton = event.button;
-  sendMouse(pointerSample(event), 1);
+  pointerInput.button(pointerSample(event), 1);
 });
 canvas.addEventListener("pointerup", (event) => {
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
-  sendMouse(pointerSample(event), 2);
+  pointerInput.button(pointerSample(event), 2);
   activePointerButton = 0;
 });
 canvas.addEventListener("pointercancel", (event) => {
-  sendMouse({ ...pointerSample(event), button: activePointerButton, buttons: 0 }, 2);
+  pointerInput.button({ ...pointerSample(event), button: activePointerButton, buttons: 0 }, 2);
   activePointerButton = 0;
 });
 canvas.addEventListener(
@@ -679,6 +653,8 @@ canvas.addEventListener(
 );
 canvas.addEventListener("keydown", (event) => sendKey(event));
 canvas.addEventListener("keyup", (event) => sendKey(event, true));
+canvas.addEventListener("blur", releaseModifiers);
+window.addEventListener("blur", releaseModifiers);
 sendTextButton.addEventListener("click", () => {
   sendText(textInput.value);
   textInput.value = "";
@@ -712,23 +688,24 @@ qualitySelect.addEventListener("change", () => {
   const quality = Number(qualitySelect.value) as ImageQuality;
   send(Message.create({ misc: { option: { image_quality: quality } } }));
 });
+function pasteRemoteText(text: string): void {
+  if (!authenticated || serverInfo.permission_profile !== "collaboration") return;
+  for (const message of remotePasteMessages(text)) send(message);
+  canvas.focus();
+}
+
+Object.assign(window, { subnetDeskHost: {
+  pasteText: pasteRemoteText,
+  copySelection() {
+    if (!authenticated || serverInfo.permission_profile !== "collaboration") return;
+    send(remoteCopyMessage());
+  },
+} });
+
 clipboardReadButton.addEventListener("click", () => {
   void navigator.clipboard
     .readText()
-    .then((text) => {
-      send(
-        Message.create({
-          clipboard: {
-            compress: false,
-            content: encoder.encode(text),
-            width: 0,
-            height: 0,
-            format: ClipboardFormat.Text,
-            special_name: "",
-          },
-        }),
-      );
-    })
+    .then(pasteRemoteText)
     .catch(() => {
       viewerStatus.textContent = t("clipboardReadPermission");
     });

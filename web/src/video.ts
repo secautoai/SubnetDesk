@@ -26,7 +26,8 @@ export interface DecoderRecoveryState {
   maxAttempts: number;
 }
 
-const MAX_DECODE_QUEUE_SIZE = 6;
+// Bound queued work so congestion does not turn into a growing latency tail.
+const MAX_DECODE_QUEUE_SIZE = 2;
 
 export function initialDecoderRecoveryState(maxAttempts = 1): DecoderRecoveryState {
   return { attempts: 0, maxAttempts };
@@ -69,15 +70,15 @@ export function decodeVideoBatch(
   frame: ProtocolVideoFrame,
   previousState: VideoDecodeState,
   createChunk: EncodedVideoChunkFactory = (init) => new EncodedVideoChunk(init),
+  reconfigureAtKeyFrame: () => void = () => {},
 ): VideoDecodeState {
   const frames = encodedFrames(frame, previousState.codec);
   if (!frames) return previousState;
 
   let timestamp = previousState.timestamp;
   let awaitingKeyFrame =
-    previousState.awaitingKeyFrame || (decoder.decodeQueueSize ?? 0) > MAX_DECODE_QUEUE_SIZE;
+    previousState.awaitingKeyFrame || (decoder.decodeQueueSize ?? 0) >= MAX_DECODE_QUEUE_SIZE;
   let droppedFrames = previousState.droppedFrames;
-  let resetForKeyFrame = false;
   for (const encoded of frames) {
     const sourceTimestamp = Number(encoded.pts);
     timestamp = Number.isSafeInteger(sourceTimestamp) && sourceTimestamp > timestamp
@@ -88,11 +89,12 @@ export function decodeVideoBatch(
       continue;
     }
     if (awaitingKeyFrame && encoded.key) {
-      decoder.reset?.();
+      // reset() clears WebCodecs configuration. The owner must reset AND
+      // configure before decoding the key frame, using its negotiated codec.
+      reconfigureAtKeyFrame();
       awaitingKeyFrame = false;
-      resetForKeyFrame = true;
     }
-    if (!resetForKeyFrame && (decoder.decodeQueueSize ?? 0) > MAX_DECODE_QUEUE_SIZE) {
+    if ((decoder.decodeQueueSize ?? 0) >= MAX_DECODE_QUEUE_SIZE) {
       awaitingKeyFrame = true;
       droppedFrames += 1;
       continue;

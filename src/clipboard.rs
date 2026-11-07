@@ -279,7 +279,13 @@ pub fn set_text_clipboard_with_owner_sync(text: &str, side: ClipboardSide) -> Re
         None => bail!("Failed to create clipboard context"),
     };
     let data = append_owner_marker(vec![ClipboardData::Text(text.to_owned())], side);
-    clipboard_ctx.set_with_owner_marker_for_linux(&data)
+    if crate::platform::linux::is_x11() {
+        // Taking PRIMARY ownership clears the selection in X11 editors before
+        // paste can replace it. Standard paste uses CLIPBOARD instead.
+        clipboard_ctx.set(&data)
+    } else {
+        clipboard_ctx.set_with_owner_marker_for_linux(&data)
+    }
 }
 
 #[cfg(not(target_os = "android"))]

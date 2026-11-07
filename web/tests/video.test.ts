@@ -139,11 +139,38 @@ describe("WebCodecs video queue", () => {
       }),
       state,
       createChunk,
+      () => { decoder.reset(); decoder.decodeQueueSize = 0; },
     );
     expect(decoded.map(({ type }) => type)).toEqual(["key"]);
     expect(resets).toBe(1);
     expect(state.awaitingKeyFrame).toBe(false);
     expect(state.droppedFrames).toBe(2);
+  });
+
+  test("reconfigures WebCodecs after reset and bounds work within a single batch", () => {
+    let configured = true;
+    const decoded: EncodedVideoChunkInit[] = [];
+    const decoder = {
+      decodeQueueSize: 10,
+      reset: () => { configured = false; decoder.decodeQueueSize = 0; },
+      configure: () => { configured = true; },
+      decode: (chunk: EncodedVideoChunk) => {
+        if (!configured) throw new Error("InvalidStateError: decoder is unconfigured");
+        decoded.push(chunk as unknown as EncodedVideoChunkInit);
+        decoder.decodeQueueSize += 1;
+      },
+    };
+    const state = decodeVideoBatch(decoder, VideoFrame.create({ h264s: { frames: [
+      { key: true, pts: 1n, data: new Uint8Array([1]) },
+      ...Array.from({ length: 20 }, (_, i) => ({ key: false, pts: BigInt(i + 2), data: new Uint8Array([2]) })),
+    ] } }), initialVideoDecodeState("h264"), init => init as unknown as EncodedVideoChunk, () => {
+      decoder.reset();
+      decoder.configure();
+    });
+    expect(configured).toBe(true);
+    expect(decoded).toHaveLength(2);
+    expect(state.awaitingKeyFrame).toBe(true);
+    expect(state.droppedFrames).toBe(19);
   });
 
   test("uses the browser chunk constructor in the production decode path", () => {

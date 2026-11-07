@@ -1679,6 +1679,14 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
 }
 
 fn process_seq(en: &mut Enigo, sequence: &str) {
+    // libxdo's text injection drops control characters. Paste structured text
+    // through the owned clipboard instead, keeping line breaks and tabs intact.
+    #[cfg(target_os = "linux")]
+    if sequence.chars().any(|c| matches!(c, '\n' | '\r' | '\t')) {
+        input_text_via_clipboard_server(en, sequence);
+        return;
+    }
+
     // On Wayland with uinput mode:
     // - pure ASCII printable sequence: input via key sequence (custom keyboard path)
     // - any non-ASCII present: input whole sequence via clipboard to preserve order
@@ -1835,8 +1843,8 @@ fn input_char_via_clipboard_server(en: &mut Enigo, chr: char) {
     input_text_via_clipboard_server(en, &chr.to_string());
 }
 
-/// Input text via clipboard + Shift+Insert in server process.
-/// Shift+Insert is more universal than Ctrl+V, works in both GUI apps and terminals.
+/// Input text through the clipboard in the server process. X11 uses normal
+/// clipboard paste; Wayland keeps its existing Shift+Insert input path.
 ///
 /// Note: Clipboard content is NOT restored after paste - see `set_clipboard_for_paste_sync` for rationale.
 #[cfg(target_os = "linux")]
@@ -1845,6 +1853,17 @@ fn input_text_via_clipboard_server(en: &mut Enigo, text: &str) {
         return;
     }
     if !set_clipboard_for_paste_sync(text) {
+        return;
+    }
+
+    if crate::platform::linux::is_x11() {
+        // Preserve the editor's selection and use its normal clipboard paste.
+        // Shift+Insert reads PRIMARY in X11 applications and cannot replace the
+        // selection after another client takes ownership of that selection.
+        if en.key_down(Key::Control).is_ok() {
+            en.key_click(Key::Layout('v'));
+            en.key_up(Key::Control);
+        }
         return;
     }
 
