@@ -46,6 +46,10 @@ jobs:
           grep -Fq 'rm -f flutter/bin/cache/flutter_tools.snapshot flutter/bin/cache/flutter_tools.stamp' .github/workflows/flutter-build.yml
           grep -Fq 'flutter precache --linux --force' .github/workflows/flutter-build.yml
           ! grep -Fq 'flutter-elinux' .github/workflows/flutter-build.yml
+          grep -Fq "features.append('software-update')" build.py
+          grep -Fq 'id: update_signing' .github/workflows/flutter-build.yml
+          grep -Fq "if: steps.update_signing.outputs.enabled == 'true'" .github/workflows/flutter-build.yml
+          grep -Fq 'Skipping signed update manifest' .github/workflows/flutter-build.yml
           sed -n '/^  build-for-windows-flutter:/,/^  build-for-windows-sciter:/p' .github/workflows/flutter-build.yml | grep -Fq 'toolchain: ${{ env.RUST_VERSION }}'
           ! sed -n '/^  build-for-windows-flutter:/,/^  build-for-windows-sciter:/p' .github/workflows/flutter-build.yml | grep -Fq 'toolchain: ${{ env.SCITER_RUST_VERSION }}'
           for artifact in \
@@ -59,11 +63,29 @@ jobs:
             grep -Fq "$artifact" .github/workflows/flutter-build.yml
           done
 
+      - name: Check Android signing contract
+        run: |
+          grep -Fq 'ANDROID_SIGNING_CERT_SHA256' .github/workflows/flutter-build.yml
+          grep -Fq 'Verify fixed Android signing certificate' .github/workflows/flutter-build.yml
+          grep -Fq 'scripts/extract_android_cert_sha256.sh' .github/workflows/flutter-build.yml
+          ! grep -Fq 'Publish unsigned apk package' .github/workflows/flutter-build.yml
+          expected=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          for output in \
+            "Signer #1 certificate SHA-256 digest: $expected" \
+            "V2 Signer: certificate SHA-256 digest: $expected"
+          do
+            actual=$(printf '%s\n' "$output" | bash scripts/extract_android_cert_sha256.sh)
+            test "$actual" = "$expected"
+          done
+
       - name: Check release upload retry contract
         run: bash scripts/check_release_upload_retry.sh
 
+      - name: Test automatic update manifest generation
+        run: python3 scripts/test_generate_update_manifest.py
+
       - name: Check Python scripts
-        run: python3 -m py_compile build.py scripts/generate_subnetdesk_icons.py
+        run: python3 -m py_compile build.py scripts/generate_subnetdesk_icons.py scripts/generate_update_manifest.py scripts/test_generate_update_manifest.py
 
       - name: Check workflow syntax
         run: |
